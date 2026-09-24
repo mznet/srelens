@@ -95,6 +95,11 @@ describe("TabStrip", () => {
     expect(tab("Pods").contains(icon)).toBe(true);
     expect(icon.getAttribute("aria-hidden")).toBe("true");
   });
+
+  it("pushes the close control to the trailing edge of a tab", () => {
+    const css = readFileSync(join(__dirname, "styles/kit.css"), "utf8");
+    expect(css).toMatch(/\.tab-close\s*\{[^}]*margin-left:\s*auto/);
+  });
 });
 
 /**
