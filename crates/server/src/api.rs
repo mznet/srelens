@@ -737,6 +737,71 @@ mod tests {
         }
     }
 
+    /// A kubeconfig whose one context, cluster and user are all named `name`.
+    fn kubeconfig(name: &str) -> String {
+        format!(
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: {name}\n  cluster: {{server: https://127.0.0.1:1}}\nusers:\n- name: {name}\n  user: {{token: t}}\ncontexts:\n- name: {name}\n  context: {{cluster: {name}, user: {name}}}\n"
+        )
+    }
+
+    fn context_names(listed: &Value) -> Vec<&str> {
+        listed["contexts"]
+            .as_array()
+            .expect("contexts")
+            .iter()
+            .map(|c| c["name"].as_str().expect("name"))
+            .collect()
+    }
+
+    /// Every user's registry runs in one process as one UID, and each user's
+    /// kubeconfigs are materialized at a predictable path
+    /// (`<data>/runtime/users/<id>/kc-<row id>.yaml`). One user naming another's
+    /// file must neither list it nor put it in their client cache, where every
+    /// later capability would resolve its contexts — with its credentials.
+    #[tokio::test]
+    async fn web_list_contexts_never_reads_a_caller_named_kubeconfig() {
+        let state = apps_state().await;
+        let (alice_id, alice) = sign_in(&state, "alice").await;
+        let (bob_id, _) = sign_in(&state, "bob").await;
+        for (user_id, name) in [(alice_id, "alices"), (bob_id, "bobs")] {
+            state
+                .db
+                .put_kubeconfig(user_id, name, &state.master_key, &kubeconfig(name), 1)
+                .await
+                .unwrap();
+        }
+        let bobs_env = state
+            .user_envs
+            .env_for(&state.db, &state.master_key, bob_id)
+            .await
+            .unwrap();
+
+        let (status, refused) = call(
+            &state,
+            &alice,
+            "k8s.listContexts",
+            json!({ "paths": bobs_env.paths }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert!(!refused.to_string().contains("bobs"), "{refused}");
+
+        let alices_env = state
+            .user_envs
+            .env_for(&state.db, &state.master_key, alice_id)
+            .await
+            .unwrap();
+        assert_eq!(alices_env.cache.paths().await, alices_env.paths);
+
+        // What the web app sends, and what an MCP-style caller sends: both list
+        // the user's own contexts, and only those.
+        for input in [json!({ "paths": [] }), json!({})] {
+            let (status, listed) = call(&state, &alice, "k8s.listContexts", input.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{input}: {listed}");
+            assert_eq!(context_names(&listed), ["alices"], "{input}");
+        }
+    }
+
     /// #543. Keeping an app's secret needs a store the web host does not have
     /// (per-user storage is #522's), so a set is refused before dispatch —
     /// never answered by something that would keep the value somewhere else —

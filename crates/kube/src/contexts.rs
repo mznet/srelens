@@ -140,44 +140,81 @@ pub fn list_contexts_capability(
                         }
                     }
                 }
-                // `default_paths` and the cache seed are both snapshots, so a
-                // kubeconfig deleted while the app runs would otherwise be
-                // reintroduced on every call and sit in the cache forever —
-                // where `load_kubeconfigs` is strict and fails the
-                // merged-resolution fallback on the missing file. Only ABSENT
-                // files are dropped: one that exists but is malformed still
-                // reaches the reader and surfaces its parse error, which the
-                // caller needs to see.
-                paths.retain(|path| !matches!(path.try_exists(), Ok(false)));
-                cache.set_paths(paths).await;
-                // Enumerate every context across all files with duplicate-name
-                // disambiguation, so contexts that share a name (e.g. `default`
-                // across per-cluster kubeconfigs) are all visible and each
-                // resolves to its own file — kube-rs merge would drop them.
-                let paths = cache.paths().await;
-                let mut configs = Vec::new();
-                let mut failed = Vec::new();
-                for path in &paths {
-                    match kube::config::Kubeconfig::read_from(path) {
-                        Ok(config) => configs.push(SourceConfig { source: path.clone(), config }),
-                        // Parser errors may quote credential values. Report the
-                        // source, never its contents, on this read-only surface.
-                        Err(_) => failed.push(path.display().to_string()),
-                    }
-                }
-                if configs.is_empty() {
-                    return Err(CapabilityError::Handler(
-                        "no kubeconfig contexts could be read".to_string(),
-                    ));
-                }
-                let contexts = resolve_from(&configs).into_iter().map(build_context_dto).collect();
-                let error = if failed.is_empty() { None } else {
-                    Some(format!("Could not read kubeconfig files: {}", failed.join(", ")))
-                };
-                Ok(ListContextsOut { contexts, error })
+                list_from(&cache, paths).await
             }
         },
     )
+}
+
+/// `k8s.listContexts` over exactly `paths` — for a host where the caller must
+/// not choose the files: the web server, where every user's registry runs in
+/// one process as one UID. Unlike [`list_contexts_capability`] it merges no
+/// managed folder (that folder is the host's, not the user's) and refuses a
+/// caller's `paths`, since another user's kubeconfig sits at a path the server
+/// can read. Refused rather than ignored, so a caller that named files is told
+/// they were not read instead of being answered from a different set. An empty
+/// list, which the web app sends, and an absent one are the same request.
+pub fn list_own_contexts_capability(cache: Arc<ClientCache>, paths: Vec<PathBuf>) -> Capability {
+    Capability::typed::<ListContextsIn, ListContextsOut, _, _>(
+        "k8s.listContexts",
+        "list the kube contexts available in the kubeconfig",
+        Annotations::READ_ONLY,
+        move |input: ListContextsIn| {
+            let cache = cache.clone();
+            let paths = paths.clone();
+            async move {
+                if input.paths.is_some_and(|named| !named.is_empty()) {
+                    return Err(CapabilityError::InvalidInput(
+                        "`paths` is not accepted here: this host lists only the kubeconfigs it \
+                         holds for you"
+                            .to_string(),
+                    ));
+                }
+                list_from(&cache, paths).await
+            }
+        },
+    )
+}
+
+/// Make `paths` the cache's active set and list every context across them.
+async fn list_from(
+    cache: &ClientCache,
+    mut paths: Vec<PathBuf>,
+) -> Result<ListContextsOut, CapabilityError> {
+    // The paths a capability starts from and the cache seed are both
+    // snapshots, so a kubeconfig deleted while the app runs would otherwise be
+    // reintroduced on every call and sit in the cache forever — where
+    // `load_kubeconfigs` is strict and fails the merged-resolution fallback on
+    // the missing file. Only ABSENT files are dropped: one that exists but is
+    // malformed still reaches the reader and surfaces its parse error, which
+    // the caller needs to see.
+    paths.retain(|path| !matches!(path.try_exists(), Ok(false)));
+    cache.set_paths(paths).await;
+    // Enumerate every context across all files with duplicate-name
+    // disambiguation, so contexts that share a name (e.g. `default` across
+    // per-cluster kubeconfigs) are all visible and each resolves to its own
+    // file — kube-rs merge would drop them.
+    let paths = cache.paths().await;
+    let mut configs = Vec::new();
+    let mut failed = Vec::new();
+    for path in &paths {
+        match kube::config::Kubeconfig::read_from(path) {
+            Ok(config) => configs.push(SourceConfig { source: path.clone(), config }),
+            // Parser errors may quote credential values. Report the source,
+            // never its contents, on this read-only surface.
+            Err(_) => failed.push(path.display().to_string()),
+        }
+    }
+    if configs.is_empty() {
+        return Err(CapabilityError::Handler(
+            "no kubeconfig contexts could be read".to_string(),
+        ));
+    }
+    let contexts = resolve_from(&configs).into_iter().map(build_context_dto).collect();
+    let error = if failed.is_empty() { None } else {
+        Some(format!("Could not read kubeconfig files: {}", failed.join(", ")))
+    };
+    Ok(ListContextsOut { contexts, error })
 }
 
 /// Build the DTO for one resolved context. Shared by the capability above and
@@ -550,6 +587,51 @@ mod tests {
         let cap = list_contexts_capability(ClientCache::new(path.clone()), vec![path], None);
         assert_eq!(cap.id, "k8s.listContexts");
         assert!(cap.annotations.read_only);
+    }
+
+    fn one_context(name: &str) -> String {
+        format!("clusters:\n- name: {name}\n  cluster: {{ server: https://{name} }}\ncontexts:\n- name: {name}\n  context: {{ cluster: {name}, user: {name} }}\n")
+    }
+
+    fn names(out: &serde_json::Value) -> Vec<&str> {
+        out["contexts"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn own_contexts_refuse_a_caller_named_file_and_keep_it_out_of_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("mine.yaml");
+        let theirs = dir.path().join("theirs.yaml");
+        std::fs::write(&mine, one_context("mine")).unwrap();
+        std::fs::write(&theirs, one_context("theirs")).unwrap();
+        let cache = ClientCache::new(mine.clone());
+        let mut reg = Registry::new();
+        reg.register(list_own_contexts_capability(cache.clone(), vec![mine.clone()]));
+
+        let err = reg.invoke("k8s.listContexts", json!({ "paths": [theirs] })).await.unwrap_err();
+
+        assert!(matches!(err, CapabilityError::InvalidInput(_)), "{err:?}");
+        assert_eq!(cache.paths().await, [mine]);
+    }
+
+    #[tokio::test]
+    async fn own_contexts_list_exactly_the_files_they_were_built_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("mine.yaml");
+        let stray = dir.path().join("stray.yaml");
+        std::fs::write(&mine, one_context("mine")).unwrap();
+        std::fs::write(&stray, one_context("stray")).unwrap();
+        // Whatever else reached the cache, the listing puts it back to the
+        // capability's own files.
+        let cache = ClientCache::new_many(vec![mine.clone(), stray]);
+        let mut reg = Registry::new();
+        reg.register(list_own_contexts_capability(cache.clone(), vec![mine.clone()]));
+
+        for input in [json!({ "paths": [] }), json!({})] {
+            let out = reg.invoke("k8s.listContexts", input.clone()).await.unwrap();
+            assert_eq!(names(&out), ["mine"], "{input}");
+            assert_eq!(cache.paths().await, [mine.clone()], "{input}");
+        }
     }
 
     #[tokio::test]

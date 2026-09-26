@@ -225,8 +225,8 @@ pub fn build_registry() -> Registry {
 }
 
 /// Build the registry using a caller-provided client cache AND kubeconfig
-/// paths. The web server uses this with per-user paths; the desktop/MCP
-/// surfaces delegate with the host defaults.
+/// paths — for a host whose kubeconfigs are all one person's (the TUI, tests).
+/// A web user's registry is [`build_registry_for_user`].
 pub fn build_registry_with_paths(
     cache: Arc<ClientCache>,
     kubeconfig_paths: Vec<PathBuf>,
@@ -242,6 +242,11 @@ pub fn build_registry_with_paths(
 /// server's own settings API rather than by a capability. No secret store
 /// either: the web host has none per user yet (#522), so `extension.secretStore`
 /// is not registered, and `extensions.list` reports the store unavailable.
+///
+/// And `k8s.listContexts` over their own kubeconfigs only: every user's
+/// registry runs in one process as one UID, so a file a caller names could be
+/// another user's kubeconfig, and the managed kubeconfig folder is the server
+/// host's.
 pub fn build_registry_for_user(
     cache: Arc<ClientCache>,
     kubeconfig_paths: Vec<PathBuf>,
@@ -253,8 +258,19 @@ pub fn build_registry_for_user(
         Some(apps),
         None,
         BrokeredNetwork::Off,
+        Kubeconfigs::OwnOnly,
     )
     .0
+}
+
+/// Which kubeconfig files a registry's `k8s.listContexts` may reach.
+#[derive(Clone, Copy)]
+enum Kubeconfigs {
+    /// The registry's own, the app's managed folder, and any file the caller
+    /// names: a desktop, TUI or MCP host, where all of them are the person's.
+    Local,
+    /// The registry's own and nothing else: a web user's.
+    OwnOnly,
 }
 
 /// Build a registry and optionally add the durable desktop settings surface.
@@ -314,6 +330,7 @@ pub fn build_registry_app_streams_and_secrets(
         apps,
         Some(secrets),
         BrokeredNetwork::Desktop,
+        Kubeconfigs::Local,
     );
     if let Some(path) = settings_path {
         settings::register(&mut reg, path);
@@ -330,6 +347,7 @@ fn build_with(
     apps: Option<Apps>,
     secrets: Option<Arc<dyn SecretStore>>,
     network: BrokeredNetwork,
+    kubeconfigs: Kubeconfigs,
 ) -> (Registry, Option<Arc<ExtensionStreams>>) {
     let mut reg = Registry::new();
 
@@ -339,11 +357,17 @@ fn build_with(
         |input| async move { Ok(json!({ "pong": input })) },
     ));
 
-    reg.register(srelens_kube::contexts::list_contexts_capability(
-        cache.clone(),
-        kubeconfig_paths.clone(),
-        srelens_kube::connect::default_kubeconfig_dir(),
-    ));
+    reg.register(match kubeconfigs {
+        Kubeconfigs::Local => srelens_kube::contexts::list_contexts_capability(
+            cache.clone(),
+            kubeconfig_paths.clone(),
+            srelens_kube::connect::default_kubeconfig_dir(),
+        ),
+        Kubeconfigs::OwnOnly => srelens_kube::contexts::list_own_contexts_capability(
+            cache.clone(),
+            kubeconfig_paths.clone(),
+        ),
+    });
     reg.register(srelens_kube::contexts::delete_context_capability(
         cache.clone(),
     ));
