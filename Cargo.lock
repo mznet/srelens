@@ -6580,7 +6580,9 @@ dependencies = [
 name = "srelens-registry"
 version = "0.15.0"
 dependencies = [
+ "base64 0.22.1",
  "dirs",
+ "flate2",
  "libc",
  "log",
  "proptest",
@@ -6597,6 +6599,7 @@ dependencies = [
  "srelens-mcp",
  "srelens-plugin-host",
  "srelens-streams",
+ "tar",
  "tempfile",
  "tokio",
  "url",
