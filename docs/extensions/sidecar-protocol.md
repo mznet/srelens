@@ -11,13 +11,17 @@ host, and the data directory), part of [#521](https://github.com/srelens/srelens
 The code is `crates/plugin-host/src/sidecar/`. The SDKs
 ([#576](https://github.com/srelens/srelens/issues/576)) wrap what this page specifies.
 
-**Status: nothing starts a sidecar yet.** The manifest has no executable kind: it still
-accepts only `declarative`, and the unsigned-app policy for executables is to be
-enforced when the kind is added ([specification.md](specification.md#unsigned-app-policy)).
-Registering a sidecar's operations and wiring it into the app is
-[#574](https://github.com/srelens/srelens/issues/574); the broker a sidecar calls back into
-and its data directory are built and tested, and wait for it. What is not built is listed
-under [Not yet](#not-yet).
+**Status.** An app of kind `executable` (API 0.6,
+[#574](https://github.com/srelens/srelens/issues/574)) names its sidecar's binaries and the
+operations it answers ([manifest.md](manifest.md#executable-apps)). srelens starts the
+sidecar under this supervisor the first time one of those operations is called in a
+process, and stops it when the app is disabled, updated or removed. It calls back into
+srelens only through the [broker](#calls-from-the-sidecar), and writes only its
+[data directory](#data-directory). Its log and its process show in the app's
+Inspector ([#575](https://github.com/srelens/srelens/issues/575)). Each operation is an
+MCP tool, `plugin/<id>/<operation>` ([MCP.md](../MCP.md#installed-apps-tools)). The
+registry's side is `crates/registry/src/extensions/sidecars.rs`. What is not built is
+listed under [Not yet](#not-yet).
 
 ## The wire
 
@@ -63,8 +67,9 @@ that is how it learns srelens has gone.
 
 The sidecar API has its own versions, listed in `SIDECAR_API_VERSIONS`
 (`crates/plugin-host/src/sidecar/protocol.rs`). Today there is one, `0.1.0`. It is not
-the extension API version (`SUPPORTED_API_VERSIONS`), because no manifest kind runs a
-sidecar yet. Whether the two merge when the executable kind lands is open (#574).
+the extension API version (`SUPPORTED_API_VERSIONS`), and the executable kind (#574) kept
+the two apart: a manifest names the extension API it is written for, and its sidecar
+negotiates this one at `initialize`, so each can move without the other.
 
 `initialize` offers every version srelens speaks, and the sidecar answers with the one it
 chose:
@@ -80,8 +85,12 @@ supervisor does not retry (see [States](#states)).
 
 ## Requests
 
-An app's request to its sidecar is an ordinary JSON-RPC request. The limits are host
-policy (`Limits` in `crates/plugin-host/src/sidecar/limits.rs`):
+An app's request to its sidecar is an ordinary JSON-RPC request. Today srelens sends one
+kind: a call of one of the operations the manifest declares, as a request named after the
+operation, whose `params` is the call's input after srelens has held it to the
+operation's declared inputs. A sidecar answers with any JSON result, which is what the
+caller gets. The limits are host policy (`Limits` in
+`crates/plugin-host/src/sidecar/limits.rs`):
 
 | Limit | Default | When it is reached |
 |---|---|---|
@@ -188,7 +197,8 @@ On every call, in this order:
 1. **Who is asking.** The app's ID and revision come from the supervisor that started the
    process, never from the sidecar. An app that was updated, disabled, removed or
    blocked by the unsigned-app policy is refused ("Extension was disabled, removed or
-   updated"). Starting the new revision's sidecar in its place is #574's.
+   updated"). The next operation call starts the new revision's sidecar in its place, and
+   an announced inventory write stops the old one.
 2. **Grants.** The binding must be one the app declares, and every permission it needs
    must be granted: the facade runs the install check (`validate_app`) again on each
    call, so an inventory edited by hand gains nothing. An undeclared binding is refused
@@ -205,7 +215,10 @@ On every call, in this order:
    action `delete` for `applications`"). Declined, or with no one to ask, it never runs:
    `-32002`, with the reason. This is the single host
    confirmation ([#552](https://github.com/srelens/srelens/issues/552)); the broker asks it
-   through the `Consent` trait, and a host that provides none refuses every gated call.
+   through the `Consent` trait. The desktop app's MCP server provides one, its own
+   confirmation prompt, which names the app from the window's inventory. Headless
+   `--mcp-stdio` and `--mcp-http` provide `NoConsent`, so every gated call is refused
+   there.
 5. **Cluster RBAC.** The call reaches the cluster with the user's own credentials, so the
    cluster answers for itself. A refusal from it is `-32003`, with its words.
 
@@ -533,10 +546,9 @@ uninstalled; locking it down while the app is installed is left for the escape r
 
 | What | Where |
 |---|---|
-| A manifest kind that runs a sidecar, and registering its operations as capabilities and MCP tools | [#574](https://github.com/srelens/srelens/issues/574) |
-| Starting a sidecar for an installed app, its data directory under `Apps::data_root`, and the desktop's `Consent`: the host confirmation of [#552](https://github.com/srelens/srelens/issues/552) | [#574](https://github.com/srelens/srelens/issues/574) |
+| An operation that answers with a stream: the protocol has streams, and nothing opens one on an app's behalf yet | — |
+| Shipping `srelens-sandbox-launch` in the desktop bundles, and finding a delegated cgroup on a systemd desktop; until then Linux names them with `SRELENS_SANDBOX_LAUNCHER` and `SRELENS_SANDBOX_CGROUP_ROOT` | — |
 | A "Clear data" action for an app refused for its data directory (`DataDir::clear` is there; the Inspector, #575, is where a person would find it) | not filed yet |
-| Per-app logs, the Inspector, runtime metrics | [#575](https://github.com/srelens/srelens/issues/575) |
 | JSON Schema for these messages, and the Rust and Go SDKs | [#576](https://github.com/srelens/srelens/issues/576) |
 | Memory and CPU limits on macOS | [#713](https://github.com/srelens/srelens/issues/713) |
 | The escape-hardening review of the supervisor and its backends, which the ADR assigned to #572 | [#744](https://github.com/srelens/srelens/issues/744) |

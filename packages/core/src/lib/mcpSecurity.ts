@@ -75,6 +75,19 @@ export interface ConfirmRequest {
    * when the call named nothing.
    */
   target?: ConfirmTarget | null;
+  /**
+   * The installed app that asked, when the HOST knows it: only for a call an
+   * executable app's sidecar made back into srelens (#573), whose process the
+   * supervisor started for exactly this app and revision. Never for an MCP
+   * call, whose caller is a bearer token and not an app (see
+   * {@link ConfirmTarget}).
+   *
+   * An ID and a revision, and nothing more: the window looks the name and the
+   * publisher up in its own installed inventory, so nothing on this wire names
+   * or vouches for an app, and a revision the window no longer has draws no
+   * requester line.
+   */
+  requester?: { id: string; revision: number } | null;
 }
 
 /**
