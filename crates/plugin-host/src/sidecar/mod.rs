@@ -8,14 +8,21 @@
 //!   [`Policy`]'s backoff, then disables it.
 //! - [`sandbox`]: the per-OS backends behind [`Launcher`]. On an OS without
 //!   one, a sidecar is refused.
+//! - [`CapabilityBroker`]: what a sidecar calls back into (#573), the app
+//!   facade the host UI calls, with the app's identity and an explicit cluster
+//!   context on every call, confirmation for writes, and an audit record.
+//! - [`data`]: its data directory (#573), the one path it may write: private
+//!   to its app, limited in size, removed with the app.
 //!
 //! - [`Inspect`]: what the Inspector reads from a supervisor (#575), and
 //!   [`AppLog`], the app's log it writes to.
 //!
-//! No manifest kind runs a sidecar yet (#574); the broker a sidecar calls back
-//! into is #573, the macOS memory and CPU watchdog #713.
+//! No manifest kind runs a sidecar yet (#574); the macOS memory and CPU
+//! watchdog is #713.
 
+mod broker;
 mod connection;
+pub mod data;
 mod limits;
 mod metrics;
 pub mod protocol;
@@ -23,6 +30,7 @@ pub mod sandbox;
 mod supervisor;
 
 pub use crate::app_log::{AppLog, LogLevel, LogLine, LogSource, LOG_LINES, LOG_LINE_BYTES};
+pub use broker::{AppIdentity, CallContext, CapabilityBroker, Consent, ConsentRequest, NoConsent};
 pub use connection::{Broker, NoBroker, RequestError, SidecarStream, StreamEvent, STREAM_BUFFER};
 pub use limits::{Limits, Policy};
 pub use metrics::{Inspect, Latency, RequestMetrics, SidecarMetrics, LATENCY_SAMPLES};

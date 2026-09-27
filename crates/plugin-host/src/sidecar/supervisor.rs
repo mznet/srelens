@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use super::connection::{self, human, Broker, Connection, ReadEnd, RequestError, SidecarStream};
+use super::data;
 use super::metrics::{Inspect, Recorder, SidecarMetrics};
 use super::protocol::{self, method, BoundedLines, Line, SIDECAR_API_VERSIONS};
 use super::sandbox::{Enforcement, LaunchError, Launcher, MemoryProbe, Process, SidecarCommand};
@@ -72,8 +73,9 @@ pub enum SidecarStatus {
     /// stopped until a person restarts it. `reason` is the last exit.
     Disabled { reason: String },
     /// It cannot run here: no sandbox for this OS or a layer this machine
-    /// lacks, limits nothing enforces, or no API version in common. Starting
-    /// it again would fail the same way, so nothing does unless asked.
+    /// lacks, limits nothing enforces, no API version in common, or a data
+    /// directory that is over its limit or not private (#573). Starting it
+    /// again would fail the same way, so nothing does unless asked.
     Refused { reason: String },
     /// Being stopped at the host's request.
     Stopping,
@@ -137,6 +139,10 @@ struct Shared {
     enforcement: Enforcement,
     /// The session, while the sidecar is running.
     connection: Mutex<Option<Connection>>,
+    /// The latest session, from its launch until the next: what dropping the
+    /// supervisor ends, while it starts and stops too, when `connection` is
+    /// not set but the sidecar's calls to the host may be waiting (#573).
+    session: Mutex<Option<Connection>>,
     /// The app's log: the host's, shared with the Inspector (#575).
     log: AppLog,
     recorder: Mutex<Recorder>,
@@ -193,6 +199,10 @@ impl Shared {
     fn set_connection(&self, connection: Option<Connection>) {
         *self.connection.lock().unwrap_or_else(|p| p.into_inner()) = connection;
     }
+
+    fn set_session(&self, session: Connection) {
+        *self.session.lock().unwrap_or_else(|p| p.into_inner()) = Some(session);
+    }
 }
 
 /// Supervises one sidecar. Dropping it stops the sidecar at once.
@@ -204,6 +214,18 @@ pub struct Supervisor {
 
 impl Drop for Supervisor {
     fn drop(&mut self) {
+        // The session first: every call the sidecar made is cancelled, so no
+        // confirmation it asked for is left open for a process that is gone,
+        // whether it was running, starting or being stopped.
+        let session = self
+            .shared
+            .session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(session) = session {
+            session.end("The extension was stopped");
+        }
         // Aborting drops the process handle, which kills the sidecar.
         self.task.abort();
     }
@@ -236,6 +258,7 @@ impl Supervisor {
             limits: config.limits.clone(),
             enforcement: launcher.enforcement(),
             connection: Mutex::new(None),
+            session: Mutex::new(None),
             log,
             recorder: Mutex::new(Recorder::default()),
             memory: Mutex::new(None),
@@ -424,6 +447,9 @@ enum Ended {
     Stopped(oneshot::Sender<()>),
     /// The host asked for a restart, and it has stopped.
     Restart,
+    /// srelens stopped it for what starting it again would not change: its
+    /// data directory outgrew its limit or stopped being private.
+    Refused(String),
     /// The supervisor is gone.
     Dropped,
 }
@@ -472,6 +498,17 @@ async fn supervise(
                     Ended::Restart => {
                         failures = 0;
                         continue;
+                    }
+                    Ended::Refused(reason) => {
+                        shared.log(LogLevel::Error, &reason);
+                        shared.set(SidecarStatus::Refused { reason });
+                        match wait_for_restart(&shared, &mut controls).await {
+                            true => {
+                                failures = 0;
+                                continue;
+                            }
+                            false => return,
+                        }
                     }
                     Ended::Dropped => return,
                 }
@@ -569,6 +606,9 @@ async fn start(
     if let Enforcement::Missing(why) = launcher.enforcement() {
         return Started::Refused(why);
     }
+    if let Err(why) = check_data(config).await {
+        return Started::Refused(format!("{why}, so srelens did not start it"));
+    }
     let launched = match launcher.launch(&config.command, &config.limits) {
         Ok(launched) => {
             shared.recorder().launches += 1;
@@ -578,6 +618,7 @@ async fn start(
         Err(LaunchError::Failed(why)) => return Started::Failed(why),
     };
     let (connection, lines) = Connection::new(config.limits.clone());
+    shared.set_session(connection.clone());
     tokio::spawn(connection::write(lines, launched.stdin));
     tokio::spawn(read_log(shared.clone(), launched.stderr));
     let mut reader = Some(tokio::spawn({
@@ -590,7 +631,11 @@ async fn start(
     let kill = process.killer();
     let timeout = config.limits.request_timeout;
 
-    let params = protocol::initialize_params(SIDECAR_API_VERSIONS, &config.limits);
+    let params = protocol::initialize_params(
+        SIDECAR_API_VERSIONS,
+        &config.limits,
+        &config.command.data_dir,
+    );
     let session = connection.clone();
     let handshake = async move {
         let initialized = session
@@ -717,6 +762,24 @@ async fn read_log(shared: Arc<Shared>, stderr: Box<dyn tokio::io::AsyncRead + Se
 type HealthCheck =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, RequestError>> + Send>>;
 
+type DataCheck = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+
+/// [`data::check`] of the sidecar's data directory, off the runtime's threads:
+/// a directory near its entry limit takes a moment to walk.
+fn check_data(config: &SidecarConfig) -> DataCheck {
+    let path = config.command.data_dir.clone();
+    let limits = config.limits.clone();
+    Box::pin(async move {
+        tokio::task::spawn_blocking(move || data::check(&path, &limits))
+            .await
+            .unwrap_or_else(|e| {
+                Err(format!(
+                    "srelens could not measure the extension's data directory: {e}"
+                ))
+            })
+    })
+}
+
 /// Serve a running sidecar until it ends or the host stops it.
 async fn run(
     shared: &Shared,
@@ -741,8 +804,17 @@ async fn run(
     // The health check in flight, polled beside everything else so that a
     // stop or an exit is not held up by it.
     let mut check: Option<HealthCheck> = None;
+    // The data directory is measured on its own interval, the same way.
+    let mut measure = tokio::time::interval_at(
+        Instant::now() + policy.data_check_interval,
+        policy.data_check_interval,
+    );
+    measure.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut measuring: Option<DataCheck> = None;
     // Why the host stopped the process, when it did.
     let mut stopped_because: Option<String> = None;
+    // Set with `stopped_because` when starting it again would not help.
+    let mut refused = false;
     let ended = loop {
         tokio::select! {
             biased;
@@ -750,15 +822,15 @@ async fn run(
                 let why = stopped_because
                     .take()
                     .unwrap_or_else(|| crashed(&exit.description));
-                break Ended::Crashed(why);
+                break if refused { Ended::Refused(why) } else { Ended::Crashed(why) };
             }
             end = async { reader.as_mut().expect("guarded").await }, if reader.is_some() => {
                 reader = None;
                 let why = match end {
-                    Ok(ReadEnd::Violation(v)) => format!("The extension {v}, so srelens stopped it"),
-                    // stdout closed after srelens stopped it: the exit arm
-                    // follows, with the reason already recorded.
+                    // Already stopped for another reason: that one stands, and
+                    // the exit arm follows.
                     _ if stopped_because.is_some() => continue,
+                    Ok(ReadEnd::Violation(v)) => format!("The extension {v}, so srelens stopped it"),
                     // stdout closed. Almost always the process ending; give it
                     // a moment to be reaped, so its exit says how.
                     _ => match tokio::time::timeout(Duration::from_secs(1), process.exit()).await {
@@ -791,10 +863,26 @@ async fn run(
                     connection.call(method::HEALTH, &json!({}), timeout).await
                 }));
             }
+            _ = measure.tick(), if measuring.is_none() && stopped_because.is_none() => {
+                measuring = Some(check_data(config));
+            }
+            measured = async { measuring.as_mut().expect("guarded").await }, if measuring.is_some() => {
+                measuring = None;
+                let Err(why) = measured else { continue };
+                if stopped_because.is_some() {
+                    continue;
+                }
+                let why = format!("{why}, so srelens stopped it");
+                connection.end(&why);
+                stopped_because = Some(why);
+                refused = true;
+                kill();
+            }
             answer = async { check.as_mut().expect("guarded").await }, if check.is_some() => {
                 check = None;
                 let why = match answer {
                     Ok(_) => continue,
+                    _ if stopped_because.is_some() => continue,
                     Err(RequestError::TimedOut { after, .. }) => format!(
                         "The extension did not answer its health check within {}, so srelens stopped it",
                         human(after)
@@ -813,8 +901,11 @@ async fn run(
         }
     };
     shared.set_connection(None);
-    if let Ended::Crashed(why) = &ended {
-        connection.end(why);
+    match &ended {
+        Ended::Crashed(why) | Ended::Refused(why) => connection.end(why),
+        Ended::Dropped => connection.end("The extension was stopped"),
+        // `stop` ended it.
+        Ended::Stopped(_) | Ended::Restart => {}
     }
     ended
 }

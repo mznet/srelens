@@ -32,6 +32,8 @@ pub use secret_store::{declares_secret_setting, SECRET_STORE_ANNOTATIONS};
 mod secrets_tests;
 #[cfg(test)]
 mod settings_tests;
+#[cfg(test)]
+mod sidecar_tests;
 mod signing;
 mod store;
 pub mod streams;
@@ -112,6 +114,10 @@ pub struct Apps {
     /// `None` on a host that keeps no files for its apps, which refuses to install a
     /// package and offers a catalog release's single-file manifest instead.
     packages: Option<PathBuf>,
+    /// Where each app's sidecar data directory is kept (#573), one per app,
+    /// named by `srelens_plugin_host::sidecar::data`. Apart from `packages`,
+    /// whose pruning would remove it. `None` where no sidecar runs.
+    data: Option<PathBuf>,
 }
 
 impl Apps {
@@ -128,7 +134,17 @@ impl Apps {
             },
             catalog,
             packages: None,
+            data: None,
         }
+    }
+
+    /// The root of the apps' data directories: where the host that starts an
+    /// app's sidecar opens its [`srelens_plugin_host::sidecar::data::DataDir`].
+    /// Whatever is there for an app that is no longer installed is removed with
+    /// the next change to the inventory, so a later app with the same ID starts
+    /// empty.
+    pub fn data_root(&self) -> Option<&Path> {
+        self.data.as_deref()
     }
 
     /// These apps, held to `policy` on every call (#578): each read of the inventory
@@ -163,6 +179,7 @@ impl Apps {
                 trust: trust.clone(),
             },
             packages: Some(path.with_extension("packages")),
+            data: Some(path.with_extension("data")),
             inventory: Store {
                 at: Arc::new(path),
                 trust,
@@ -171,9 +188,9 @@ impl Apps {
     }
 }
 
-/// The desktop's layout: the inventory file, this host's own catalog cache beside it, and
-/// the directory installed packages are unpacked into beside that, all verified against the
-/// root this build pins.
+/// The desktop's layout: the inventory file, this host's own catalog cache beside it, the
+/// directory installed packages are unpacked into beside that, and the apps' data, all
+/// verified against the root this build pins.
 impl From<PathBuf> for Apps {
     fn from(path: PathBuf) -> Self {
         Self::with_trust(path, TrustRoot::pinned())
@@ -1594,6 +1611,14 @@ fn configure(
     // The inventory as saved: the policy's verdicts are applied to the answer, never
     // saved, so lifting a policy restores each app as its user left it (#578).
     let mut state = store.read_saved()?;
+    // The apps installed now, so that those this change uninstalls can be told
+    // apart afterwards (their AppContainer profiles, on Windows).
+    #[cfg(windows)]
+    let installed_before: Vec<String> = state
+        .plugins
+        .iter()
+        .map(|app| app.manifest.id.clone())
+        .collect();
     let policy = store.policy();
     // Held to the publisher that signed it, as verified now: none for an unsigned app.
     let refusal = |manifest: &Manifest, signer: Option<&trust::Signer>| -> Result<(), String> {
@@ -1864,10 +1889,43 @@ fn configure(
     if let Some(root) = &apps.packages {
         package::prune(root, &kept_packages(&state));
     }
+    // And the data an uninstalled app's sidecar kept (#573). Best effort, as the
+    // packages are: a directory that cannot be removed now is tried again with the
+    // next change.
+    if let Some(root) = &apps.data {
+        let installed: Vec<&str> = state.plugins.iter().map(|app| app.manifest.id.as_str()).collect();
+        if let Err(error) = srelens_plugin_host::sidecar::data::prune(root, &installed) {
+            log::warn!(
+                "could not remove an uninstalled app's data under {}: {error}",
+                root.display()
+            );
+        }
+    }
+    // And, on Windows, an uninstalled app's AppContainer profile (#573): its folder
+    // and its registry storage, both of which its sidecar could write outside its
+    // data directory. Best effort, as the rest is. Nothing starts a sidecar yet
+    // (#574); when something does, it stops the app's sidecar before this runs.
+    #[cfg(windows)]
+    for id in uninstalled(&installed_before, &state) {
+        if let Err(error) = srelens_plugin_host::sidecar::sandbox::delete_profile(id) {
+            log::warn!("could not delete the AppContainer profile of the uninstalled app {id}: {error}");
+        }
+    }
     app_policy::govern(&mut state, policy.as_deref());
     secret_store::sweep(secrets, &state);
     streams::announce(&store.key(), &state);
     Ok(state)
+}
+
+/// Of the apps in `before`, the ones `after` no longer holds: what a change
+/// uninstalled.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn uninstalled<'a>(before: &'a [String], after: &Inventory) -> Vec<&'a str> {
+    before
+        .iter()
+        .filter(|id| !after.plugins.iter().any(|app| app.manifest.id == **id))
+        .map(String::as_str)
+        .collect()
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
